@@ -34,6 +34,7 @@ import sys
 import time as clock
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import NoReturn
 
 DEFAULT_SIGNALS = (1, 2, 3, 4, 6, 7, 9, 11, 15)
 SIGNAMES = {1: "HUP", 2: "INT", 3: "QUIT", 4: "ILL", 6: "ABRT", 7: "BUS",
@@ -78,7 +79,7 @@ EXIT_RE = re.compile(
     r"^(?P<time>\S+) EXIT-BY-SIGNAL (?P<comm>\S+) pid=(?P<pid>\d+) sig=(?P<sig>\d+)$")
 
 
-def fail(msg: str, code: int = 1) -> "NoReturn":
+def fail(msg: str, code: int = 1) -> NoReturn:
     print(f"who-killed: {msg}", file=sys.stderr)
     raise SystemExit(code)
 
@@ -109,7 +110,7 @@ def unit_name(stem: str) -> str:
 
 
 def run(cmd: list[str]) -> subprocess.CompletedProcess:
-    return subprocess.run(cmd, capture_output=True, text=True)
+    return subprocess.run(cmd, check=False, capture_output=True, text=True)
 
 
 def render(targets: list[str], signals: list[int], lead: bool) -> str:

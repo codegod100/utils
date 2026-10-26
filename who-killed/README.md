@@ -71,6 +71,9 @@ it stops itself.
 - systemd, for transient units via `systemd-run`
 - Tested on Garuda/Arch, kernel 6.x, bpftrace 0.27
 
+Both are system packages. They stay that way on purpose: conda-forge has no
+`bpftrace`, and the probe runs it as root, outside any pixi environment.
+
 ## Limits
 
 - Matches the 15-byte process name (`comm`), not the command line.

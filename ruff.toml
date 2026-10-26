@@ -1,0 +1,9 @@
+# Each tool is a single Python executable without a `.py` extension, so it can
+# be symlinked straight onto PATH -- which puts it outside Ruff's file
+# discovery. One entry per tool, kept in step with pixi.toml's tasks.
+extend-include = ["*/who-killed"]
+
+# Pin the target instead of letting Ruff infer it from the interpreter it runs
+# under: the tools run under whatever `python3` the system has, and lint should
+# not demand syntax newer than that. py39 is Ruff's own fallback.
+target-version = "py39"

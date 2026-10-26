@@ -1,0 +1,20 @@
+[workspace]
+name = "utils"
+channels = ["conda-forge"]
+platforms = ["linux-64"]
+
+[dependencies]
+python = "3.13.*"
+ruff = ">=0.17"
+
+# The tools themselves are stdlib-only and run under the system `python3`: the
+# probe re-execs through sudo, where this environment is not on the path. pixi
+# is here for a reproducible dev environment and the task list below, not as a
+# runtime for the tools.
+[tasks]
+who-killed = "python who-killed/who-killed"
+lint = "ruff check who-killed"
+install = "mkdir -p \"$HOME/.local/bin\" && ln -sfn \"$PIXI_PROJECT_ROOT/who-killed/who-killed\" \"$HOME/.local/bin/who-killed\""
+
+# No `format` task on purpose: `ruff format` explodes the compact tables and
+# aligned argument lists these tools are written with.
