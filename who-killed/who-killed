@@ -130,14 +130,15 @@ def clear_unit(unit: str) -> None:
     run(["systemctl", "reset-failed", unit])
 
 
-def start_unit(unit: str, bt: Path, log: Path, seconds: int) -> bool:
+def start_unit(unit: str, tracer: Path, program: Path, log: Path,
+               seconds: int) -> bool:
     """Start the probe; True once bpftrace reports it attached."""
     cmd = ["systemd-run", f"--unit={unit}",
-           f"--description=who-killed: {bt.stem}",
+           f"--description=who-killed: {program.stem}",
            f"--property=RuntimeMaxSec={seconds}",
            f"--property=StandardOutput=append:{log}",
            f"--property=StandardError=append:{log}",
-           "--", "bpftrace", str(bt)]
+           "--", str(tracer), str(program)]
     proc = run(cmd)
     if proc.returncode != 0:
         detail = (proc.stderr or proc.stdout).strip().splitlines()[-3:]
@@ -158,21 +159,40 @@ def start_unit(unit: str, bt: Path, log: Path, seconds: int) -> bool:
     return False
 
 
-def escalate() -> None:
+def escalate(extra: list[str] | None = None) -> None:
     """Become root for the parts that need it.
 
     `sudo who-killed` cannot work: sudo runs its command with a fixed
     secure_path that excludes ~/.local/bin, so it never finds this script.
     Re-exec through our own absolute path instead, prompting on a terminal;
     with no terminal, print the command rather than hang on a prompt.
+
+    `extra` carries what must survive the re-exec: the tracer's absolute path,
+    which root's secure_path would otherwise fail to resolve.
     """
     if os.geteuid() == 0:
         return
     me = str(Path(__file__).resolve())
+    argv = ["sudo", me, *(extra or []), *sys.argv[1:]]
     if sys.stdin.isatty():
-        os.execvp("sudo", ["sudo", me, *sys.argv[1:]])
+        os.execvp("sudo", argv)
     fail("this needs root to attach kernel tracepoints:\n"
-         f"  sudo {me} {' '.join(sys.argv[1:])}")
+         f"  {' '.join(argv)}")
+
+
+def bpftrace_path(explicit: str | None) -> Path:
+    """The bpftrace to run, resolved before the sudo re-exec.
+
+    bpftrace is picked up from PATH as the invoking user, then carried across
+    the re-exec and into the systemd unit as an absolute path: the unit runs
+    with root's PATH, which is not the caller's, so a tracer from a pixi
+    environment would never be found by name.
+    """
+    found = explicit or shutil.which("bpftrace")
+    if not found:
+        fail("bpftrace is not on PATH: install it (pacman -S bpftrace), or run"
+             " this from the repo's environment (pixi run who-killed NAME)")
+    return Path(found).resolve()
 
 
 def arm(args: argparse.Namespace) -> int:
@@ -180,9 +200,8 @@ def arm(args: argparse.Namespace) -> int:
         if not TARGET_RE.match(t):
             fail(f"bad name {t!r}: 1-15 chars of letters, digits, _ . : + -"
                  " (the kernel caps process names at 15)")
-    escalate()
-    if not shutil.which("bpftrace"):
-        fail("bpftrace is not installed (pacman -S bpftrace, or apt install bpftrace)")
+    tracer = bpftrace_path(args.bpftrace)
+    escalate(["--bpftrace", str(tracer)])
 
     logdir = state_dir()
     logdir.mkdir(parents=True, exist_ok=True)
@@ -196,7 +215,7 @@ def arm(args: argparse.Namespace) -> int:
 
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     log = logdir / f"{stem}-{stamp}.log"
-    bt = logdir / f"{stem}.bt"
+    program = logdir / f"{stem}.bt"
     log.write_text(
         f"# who-killed: {', '.join(args.targets)}\n"
         f"# started: {datetime.now().astimezone().isoformat(timespec='seconds')}\n"
@@ -204,7 +223,7 @@ def arm(args: argparse.Namespace) -> int:
         f"# runtime: {args.seconds}s, then the unit stops itself\n"
         f"# report:  who-killed --report --log {log}\n"
         f"# stop:    who-killed --stop {stem}\n\n")
-    give_to_invoker(log, bt)
+    give_to_invoker(log, program)
 
     # The richer probe names the sender's *process*; if a kernel field it needs
     # is unavailable, fall back to the probe that is known to attach.
@@ -214,9 +233,9 @@ def arm(args: argparse.Namespace) -> int:
     for attempt, lead in ((1, True), (2, False)):
         if attempt == 2:
             clear_unit(unit)
-        bt.write_text(render(args.targets, args.signals, lead))
-        give_to_invoker(bt)
-        if start_unit(unit, bt, log, args.seconds):
+        program.write_text(render(args.targets, args.signals, lead))
+        give_to_invoker(program)
+        if start_unit(unit, tracer, program, log, args.seconds):
             if not lead:
                 log.write_text(log.read_text() +
                                "# note: fell back to the simpler probe (no sender"
@@ -425,6 +444,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--status", action="store_true", help="what is armed")
     p.add_argument("--stop", action="store_true", help="stop the probe early")
     p.add_argument("--replace", action="store_true", help="restart an armed probe")
+    # Internal: the tracer's absolute path, handed over by escalate() so the
+    # root-side process does not have to resolve bpftrace from PATH again.
+    p.add_argument("--bpftrace", default=None, metavar="PATH", help=argparse.SUPPRESS)
     args = p.parse_args(argv)
 
     args.signals = parse_signals(args.signals) if args.signals else list(DEFAULT_SIGNALS)

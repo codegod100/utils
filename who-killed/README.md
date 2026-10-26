@@ -71,8 +71,12 @@ it stops itself.
 - systemd, for transient units via `systemd-run`
 - Tested on Garuda/Arch, kernel 6.x, bpftrace 0.27
 
-Both are system packages. They stay that way on purpose: conda-forge has no
-`bpftrace`, and the probe runs it as root, outside any pixi environment.
+`bpftrace` comes either from the repo's pixi environment (`pixi run who-killed
+…`, which pins 0.27 from the `nandi-testing` channel — conda-forge has none) or
+from the distro. Either way it runs as root: the tracer is resolved as the
+invoking user and its absolute path is carried into the systemd unit, because
+`sudo`'s `secure_path` cannot see a pixi environment. systemd stays a system
+package.
 
 ## Limits
 

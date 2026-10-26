@@ -1,16 +1,21 @@
 [workspace]
 name = "utils"
-channels = ["conda-forge"]
+# conda-forge first on purpose: the channel below also carries `elfutils`, and
+# under strict channel priority the earlier entry wins, so listing it first
+# would shadow conda-forge's.
+channels = ["conda-forge", "https://prefix.dev/nandi-testing"]
 platforms = ["linux-64"]
 
 [dependencies]
 python = "3.13.*"
 ruff = ">=0.17"
+# Not on conda-forge; built and published from github.com/nandi-conda/bpftrace.
+bpftrace = "0.27.*"
 
-# The tools themselves are stdlib-only and run under the system `python3`: the
-# probe re-execs through sudo, where this environment is not on the path. pixi
-# is here for a reproducible dev environment and the task list below, not as a
-# runtime for the tools.
+# The tools are stdlib-only and run under the system `python3`, not pixi's: they
+# have to work from a plain symlink on PATH. This environment supplies the
+# tracer, which `who-killed` hands to the root-side systemd unit by absolute
+# path, since root's PATH is not this one.
 [tasks]
 who-killed = "python who-killed/who-killed"
 lint = "ruff check who-killed"

@@ -34,9 +34,11 @@ Two things pixi deliberately does not cover:
 
 - **The tools run under the system `python3`, not pixi's.** They are
   stdlib-only, and `who-killed` re-execs itself through `sudo`, where pixi's
-  environment is not on the path. pixi supplies the tooling around them.
-- **`bpftrace` and `systemd` stay system packages.** Neither is on
-  conda-forge, and the probe runs them as root.
+  environment is not on the path.
+- **`systemd` stays a system package.** `bpftrace` does not: it is built and
+  published to the `nandi-testing` channel on prefix.dev (conda-forge has
+  none), and the tools pass its absolute path into the root-side systemd unit
+  rather than relying on root's `PATH`.
 
 Adding a tool takes three entries: `extend-include` in `ruff.toml` (the tools
 have no `.py` extension, so Ruff cannot discover them on its own), the
