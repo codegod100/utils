@@ -1,0 +1,445 @@
+#!/usr/bin/env python3
+"""who-killed: find who sends signals to a process.
+
+An external SIGKILL leaves nothing on the victim's side: it cannot be caught, no
+crash dump is written, and journald records nothing. Only a sender-side
+tracepoint sees it, so this arms a short-lived root bpftrace probe as a
+transient systemd unit, then reads the log back.
+
+    who-killed chrome                  arm for 1h (asks for sudo), log in
+                                       ~/.local/state/who-killed/
+    who-killed --report                who was it? self-signals filtered out
+    who-killed --status                what is armed now
+    who-killed --stop                  stop early (it also stops itself on time)
+
+Read a line as:
+
+    18:55:21 SIGNAL 15 -> chrome pid=3228318 | sender pkill sproc=pkill pid=3237890
+             uid=1000 ppid=3237873 pcomm=sh ppid2=3113688 pcomm2=delta-app | si_code=0
+
+pkill (3237890) sent SIGTERM to chrome (3228318). Its parent is sh, and that
+shell's parent is delta-app. si_code=0 is SI_USER: an ordinary userspace
+kill(2)/pkill, not the kernel.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import pwd
+import re
+import shutil
+import subprocess
+import sys
+import time as clock
+from datetime import datetime, timezone
+from pathlib import Path
+
+DEFAULT_SIGNALS = (1, 2, 3, 4, 6, 7, 9, 11, 15)
+SIGNAMES = {1: "HUP", 2: "INT", 3: "QUIT", 4: "ILL", 6: "ABRT", 7: "BUS",
+            9: "KILL", 11: "SEGV", 15: "TERM"}
+UNIT_PREFIX = "who-killed-"
+# comm is capped at 15 bytes by the kernel, and this charset keeps the value
+# safe to write into both the bpftrace program and a systemd unit name.
+TARGET_RE = re.compile(r"^[A-Za-z0-9_.:+-]{1,15}$")
+
+SIGNAL_PROBE = """\
+tracepoint:signal:signal_generate
+/ ({cond}) && ({sigs}) /
+{{
+    $p = curtask->real_parent;
+    $g = $p->real_parent;
+{lead_decl}    time("%H:%M:%S ");
+    printf("SIGNAL %d -> %s pid=%d | sender %s {sproc_fmt}pid=%d uid=%d ppid=%d pcomm=%s ppid2=%d pcomm2=%s | si_code=%d\\n",
+           args->sig, args->comm, args->pid, comm, {sproc_arg}pid, uid,
+           $p->tgid, $p->comm, $g->tgid, $g->comm, args->code);
+}}
+
+tracepoint:sched:sched_process_exit
+/ ({exits}) && pid == tid && ((curtask->exit_code & 0x7f) != 0) /
+{{
+    time("%H:%M:%S ");
+    printf("EXIT-BY-SIGNAL %s pid=%d sig=%d\\n", comm, pid,
+           curtask->exit_code & 0x7f);
+}}
+"""
+# comm is the *thread's* name, so a browser's own thread pool reports as
+# "ThreadPoolSingl" and looks like a stranger. group_leader->comm names the
+# process instead, which is what "did it signal itself?" needs.
+LEAD_DECL = "    $lead = curtask->group_leader;\n"
+
+SIGNAL_RE = re.compile(
+    r"^(?P<time>\S+) SIGNAL (?P<sig>\d+) -> (?P<tcomm>\S+) pid=(?P<tpid>\d+)"
+    r" \| sender (?P<scomm>\S+)(?: sproc=(?P<sproc>\S+))? pid=(?P<spid>\d+)"
+    r" uid=(?P<uid>-?\d+) ppid=(?P<ppid>-?\d+) pcomm=(?P<pcomm>\S*)"
+    r"(?: ppid2=(?P<ppid2>-?\d+) pcomm2=(?P<pcomm2>\S*))?"
+    r" \| si_code=(?P<code>-?\d+)$")
+EXIT_RE = re.compile(
+    r"^(?P<time>\S+) EXIT-BY-SIGNAL (?P<comm>\S+) pid=(?P<pid>\d+) sig=(?P<sig>\d+)$")
+
+
+def fail(msg: str, code: int = 1) -> "NoReturn":
+    print(f"who-killed: {msg}", file=sys.stderr)
+    raise SystemExit(code)
+
+
+def state_dir() -> Path:
+    """Logs live in the invoking user's state dir, so --report needs no sudo
+    even though the probe itself runs as root."""
+    if os.geteuid() == 0 and os.environ.get("SUDO_USER"):
+        home = Path(pwd.getpwnam(os.environ["SUDO_USER"]).pw_dir)
+    else:
+        home = Path.home()
+    return home / ".local" / "state" / "who-killed"
+
+
+def give_to_invoker(*paths: Path) -> None:
+    uid, gid = os.environ.get("SUDO_UID"), os.environ.get("SUDO_GID")
+    if os.geteuid() != 0 or not (uid and gid):
+        return
+    for p in paths:
+        try:
+            os.chown(p, int(uid), int(gid))
+        except OSError:
+            pass
+
+
+def unit_name(stem: str) -> str:
+    return UNIT_PREFIX + re.sub(r"[^A-Za-z0-9_.-]", "-", stem)
+
+
+def run(cmd: list[str]) -> subprocess.CompletedProcess:
+    return subprocess.run(cmd, capture_output=True, text=True)
+
+
+def render(targets: list[str], signals: list[int], lead: bool) -> str:
+    return SIGNAL_PROBE.format(
+        cond=" || ".join(f'str(args->comm) == "{t}"' for t in targets),
+        sigs=" || ".join(f"args->sig == {s}" for s in signals),
+        exits=" || ".join(f'comm == "{t}"' for t in targets),
+        lead_decl=LEAD_DECL if lead else "",
+        sproc_fmt="sproc=%s " if lead else "",
+        sproc_arg="$lead->comm, " if lead else "")
+
+
+def clear_unit(unit: str) -> None:
+    """Retire a unit so its name is free again: systemd-run has no --replace,
+    and a stopped unit still holds its name."""
+    run(["systemctl", "stop", unit])
+    run(["systemctl", "reset-failed", unit])
+
+
+def start_unit(unit: str, bt: Path, log: Path, seconds: int) -> bool:
+    """Start the probe; True once bpftrace reports it attached."""
+    cmd = ["systemd-run", f"--unit={unit}",
+           f"--description=who-killed: {bt.stem}",
+           f"--property=RuntimeMaxSec={seconds}",
+           f"--property=StandardOutput=append:{log}",
+           f"--property=StandardError=append:{log}",
+           "--", "bpftrace", str(bt)]
+    proc = run(cmd)
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout).strip().splitlines()[-3:]
+        log.write_text(log.read_text() + "\n# start failed: " + " ".join(detail) + "\n")
+        return False
+    for _ in range(100):
+        clock.sleep(0.1)
+        text = log.read_text(errors="replace")
+        # bpftrace 0.27 prints "Attached 2 probes"; older builds print
+        # "Attaching 2 probes...". Warnings about probe read helpers are
+        # harmless and only appear after attaching.
+        if "Attached " in text or "Attaching " in text:
+            return True
+        if "ERROR:" in text:
+            return False
+        if run(["systemctl", "is-active", unit]).stdout.strip() not in ("active", "activating"):
+            return False
+    return False
+
+
+def escalate() -> None:
+    """Become root for the parts that need it.
+
+    `sudo who-killed` cannot work: sudo runs its command with a fixed
+    secure_path that excludes ~/.local/bin, so it never finds this script.
+    Re-exec through our own absolute path instead, prompting on a terminal;
+    with no terminal, print the command rather than hang on a prompt.
+    """
+    if os.geteuid() == 0:
+        return
+    me = str(Path(__file__).resolve())
+    if sys.stdin.isatty():
+        os.execvp("sudo", ["sudo", me, *sys.argv[1:]])
+    fail("this needs root to attach kernel tracepoints:\n"
+         f"  sudo {me} {' '.join(sys.argv[1:])}")
+
+
+def arm(args: argparse.Namespace) -> int:
+    for t in args.targets:
+        if not TARGET_RE.match(t):
+            fail(f"bad name {t!r}: 1-15 chars of letters, digits, _ . : + -"
+                 " (the kernel caps process names at 15)")
+    escalate()
+    if not shutil.which("bpftrace"):
+        fail("bpftrace is not installed (pacman -S bpftrace, or apt install bpftrace)")
+
+    logdir = state_dir()
+    logdir.mkdir(parents=True, exist_ok=True)
+    give_to_invoker(logdir)
+
+    stem = "-".join(args.targets)
+    unit = unit_name(stem)
+    if not args.replace and run(["systemctl", "is-active", unit]).stdout.strip() == "active":
+        fail(f"{unit} is already active; --status to look, --stop to end it,"
+             " or --replace to restart it")
+
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    log = logdir / f"{stem}-{stamp}.log"
+    bt = logdir / f"{stem}.bt"
+    log.write_text(
+        f"# who-killed: {', '.join(args.targets)}\n"
+        f"# started: {datetime.now().astimezone().isoformat(timespec='seconds')}\n"
+        f"# signals: {', '.join(f'{s}({SIGNAMES.get(s, s)})' for s in args.signals)}\n"
+        f"# runtime: {args.seconds}s, then the unit stops itself\n"
+        f"# report:  who-killed --report --log {log}\n"
+        f"# stop:    who-killed --stop {stem}\n\n")
+    give_to_invoker(log, bt)
+
+    # The richer probe names the sender's *process*; if a kernel field it needs
+    # is unavailable, fall back to the probe that is known to attach.
+    # A finished run leaves the unit failed-with-timeout, still holding its
+    # name, and systemd-run refuses to reuse it. Free the name every time.
+    clear_unit(unit)
+    for attempt, lead in ((1, True), (2, False)):
+        if attempt == 2:
+            clear_unit(unit)
+        bt.write_text(render(args.targets, args.signals, lead))
+        give_to_invoker(bt)
+        if start_unit(unit, bt, log, args.seconds):
+            if not lead:
+                log.write_text(log.read_text() +
+                               "# note: fell back to the simpler probe (no sender"
+                               " process name); self-signals by thread name only\n")
+            print(f"armed: {unit}")
+            print(f"log:   {log}")
+            print(f"watch: tail -f {log}")
+            print(f"later: who-killed --report --log {log}")
+            print(f"stop:  who-killed --stop {stem}")
+            return 0
+        clear_unit(unit)
+
+    fail("the probe did not attach with either program. The log says:\n"
+         + "\n".join(log.read_text(errors="replace").strip().splitlines()[-8:]))
+
+
+def header_targets(path: Path) -> list[str]:
+    """The targets from the log's own header, so --report can name the unit
+    without guessing from the filename (targets may contain dashes)."""
+    for line in path.read_text(errors="replace").splitlines()[:6]:
+        if line.startswith("# who-killed: "):
+            return [t.strip() for t in line[len("# who-killed: "):].split(",") if t.strip()]
+    return []
+
+
+def read_log(path: Path):
+    """(targets, target pids, signal matches, exit matches) from one log."""
+    targets, pids, signals, exits = set(), set(), [], []
+    for line in path.read_text(errors="replace").splitlines():
+        m = SIGNAL_RE.match(line)
+        if m:
+            targets.add(m["tcomm"])
+            pids.add(int(m["tpid"]))
+            signals.append(m)
+            continue
+        m = EXIT_RE.match(line)
+        if m:
+            exits.append(m)
+    return targets, pids, signals, exits
+
+
+def report(args: argparse.Namespace) -> int:
+    if args.log:
+        path = Path(args.log).expanduser()
+        if not path.is_file():
+            fail(f"no such log: {path}")
+    else:
+        recent = lambda q: sorted(q, key=lambda f: f.stat().st_mtime)
+        if args.targets:
+            found = recent(state_dir().glob(f"{'-'.join(args.targets)}-*.log"))
+        else:
+            # A bare --report means "the probe I just armed", not "the last file
+            # touched": a finished 30s probe can out-write a longer one started
+            # later, so prefer whatever is still armed.
+            found = recent([f for stem_ in armed_stems()
+                            for f in state_dir().glob(f"{stem_}-*.log")])
+            if not found:
+                found = recent(state_dir().glob("*.log"))
+        if not found:
+            fail(f"no logs in {state_dir()}; arm one with: who-killed <name>")
+        path = found[-1]
+
+    targets, tpid_set, signals, exits = read_log(path)
+    own, foreign = 0, []
+    for m in signals:
+        proc = m["sproc"] or m["scomm"]
+        if proc in targets or m["scomm"] in targets or int(m["spid"]) in tpid_set:
+            own += 1
+        else:
+            foreign.append(m)
+
+    print(f"log: {path}")
+    names = header_targets(path)
+    if names and run(["systemctl", "is-active", unit_name("-".join(names))]).stdout.strip() in (
+            "active", "activating"):
+        print(f"(still armed: window open, {path.stat().st_size} bytes so far"
+              f" — this report is partial)")
+    print(f"{len(signals)} signal(s) to {', '.join(sorted(targets)) or 'nothing'}"
+          f": {own} self-signal(s), {len(foreign)} from outside")
+    if not targets:
+        print("\nNothing was signalled in this window.")
+
+    if foreign:
+        senders: dict[tuple, int] = {}
+        for m in foreign:
+            senders[(m["sproc"] or m["scomm"], m["pcomm"], m["pcomm2"] or "?")] = \
+                senders.get((m["sproc"] or m["scomm"], m["pcomm"], m["pcomm2"] or "?"), 0) + 1
+        print("\nSenders, by process and its two parents:")
+        for (proc, pcomm, pcomm2), n in sorted(senders.items(), key=lambda kv: -kv[1]):
+            print(f"  {n:>4}x  {proc}  <- {pcomm} <- {pcomm2}")
+        shown = foreign if args.all else foreign[-args.lines:]
+        print(f"\nThe signals (last {len(shown)} of {len(foreign)}):")
+        for m in shown:
+            sig, code = int(m["sig"]), int(m["code"])
+            origin = ("SI_USER: a userspace kill(2), e.g. kill/pkill" if code == 0
+                      else f"kernel-generated (si_code={code})" if code < 0
+                      else f"si_code={code}")
+            chain = f"parent {m['pcomm']} [{m['ppid']}]"
+            if m["pcomm2"]:
+                chain += f", grandparent {m['pcomm2']} [{m['ppid2']}]"
+            print(f"  {m['time']}  {SIGNAMES.get(sig, sig)} ({sig}) -> {m['tcomm']}"
+                  f" [{m['tpid']}]  from {m['sproc'] or m['scomm']} [{m['spid']}]  {chain}")
+            print(f"            {origin}")
+            if m["pcomm"] in ("sh", "bash", "dash", "zsh"):
+                print("            its parent is a shell: find the one-liner that"
+                      " shell was started to run")
+    elif signals:
+        print("\nNo foreign senders: every signal came from the process itself"
+              " (Chrome, for instance, kills its own renderers as tabs close).")
+
+    if exits:
+        print("\nExits by signal:")
+        for m in exits[-args.lines:]:
+            print(f"  {m['time']}  {m['comm']} [{m['pid']}]  {SIGNAMES.get(int(m['sig']), m['sig'])}")
+    return 0
+
+
+def armed_stems() -> list[str]:
+    """Targets of the probes still running, by unit name."""
+    proc = run(["systemctl", "list-units", "--plain", "--no-legend",
+                "--no-pager", UNIT_PREFIX + "*"])
+    stems = []
+    for row in proc.stdout.splitlines():
+        unit = row.split()[0]
+        if run(["systemctl", "is-active", unit]).stdout.strip() in ("active", "activating"):
+            stem = unit[len(UNIT_PREFIX):].removesuffix(".service")
+            stems.append(stem)
+    return stems
+
+
+def status(args: argparse.Namespace) -> int:
+    proc = run(["systemctl", "list-units", "--all", "--plain", "--no-legend",
+                "--no-pager", UNIT_PREFIX + "*"])
+    units = [r.split()[0] for r in proc.stdout.splitlines() if r.strip()]
+    if not units:
+        print("nothing armed")
+        return 0
+    for u in units:
+        state = run(["systemctl", "show", u, "-p", "ActiveState", "--value"]).stdout.strip()
+        result = run(["systemctl", "show", u, "-p", "Result", "--value"]).stdout.strip()
+        if state == "active":
+            print(f"{u}  armed")
+        elif result == "timeout":
+            # RuntimeMaxSec ends the unit as "failed (timeout)"; that is the
+            # window elapsing on purpose, not a fault.
+            print(f"{u}  finished (window elapsed)")
+        else:
+            print(f"{u}  {state}" + (f" ({result})" if result else ""))
+    return 0
+
+
+def stop(args: argparse.Namespace) -> int:
+    escalate()
+    if args.targets:
+        units = [unit_name("-".join(args.targets))]
+    else:
+        proc = run(["systemctl", "list-units", "--all", "--plain", "--no-legend",
+                    "--no-pager", UNIT_PREFIX + "*"])
+        units = [r.split()[0] for r in proc.stdout.splitlines() if r.strip()]
+        if not units:
+            print("nothing armed")
+            return 0
+    for u in units:
+        state = run(["systemctl", "is-active", u]).stdout.strip()
+        if state not in ("active", "activating"):
+            print(f"{u}  not running ({state})")
+            continue
+        proc = run(["systemctl", "stop", u])
+        run(["systemctl", "reset-failed", u])
+        print(f"stopped {u}" if proc.returncode == 0
+              else f"could not stop {u}: {proc.stderr.strip()}")
+    return 0
+
+
+def parse_signals(text: str) -> list[int]:
+    out = []
+    for part in text.replace(" ", "").split(","):
+        if not part:
+            continue
+        try:
+            n = int(part)
+        except ValueError:
+            fail(f"{part!r} is not a signal number")
+        if not 1 <= n <= 31:
+            fail(f"signal {n} is out of range")
+        out.append(n)
+    return sorted(set(out))
+
+
+def main(argv: list[str] | None = None) -> int:
+    p = argparse.ArgumentParser(
+        prog="who-killed",
+        description="Find who sends signals to a process, including SIGKILL,"
+                    " which leaves no trace on the victim's side.")
+    p.add_argument("targets", nargs="*", metavar="NAME",
+                   help="process name (comm) to watch, e.g. chrome")
+    p.add_argument("--seconds", type=int, default=3600,
+                   help="how long to arm for (default 3600)")
+    p.add_argument("--signals", default=None,
+                   help="comma-separated signal numbers (default: the fatal and"
+                        " stopping ones: 1,2,3,4,6,7,9,11,15)")
+    p.add_argument("--report", action="store_true", help="read a log back")
+    p.add_argument("--log", default=None, help="report on this log instead of the newest")
+    p.add_argument("--all", action="store_true", help="show every foreign signal")
+    p.add_argument("--lines", type=int, default=20, help="how many to show (default 20)")
+    p.add_argument("--status", action="store_true", help="what is armed")
+    p.add_argument("--stop", action="store_true", help="stop the probe early")
+    p.add_argument("--replace", action="store_true", help="restart an armed probe")
+    args = p.parse_args(argv)
+
+    args.signals = parse_signals(args.signals) if args.signals else list(DEFAULT_SIGNALS)
+    if args.seconds < 1:
+        fail("--seconds must be at least 1")
+
+    if args.status:
+        return status(args)
+    if args.stop:
+        return stop(args)
+    if args.report:
+        return report(args)
+    if not args.targets:
+        p.error("name a process to watch (or use --report/--status/--stop)")
+    return arm(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
